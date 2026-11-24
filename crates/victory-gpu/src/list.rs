@@ -446,6 +446,21 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            let (to_drop, from_drop) = (
+                crate::resource::mip_drop(dst),
+                crate::resource::mip_drop(src),
+            );
+            if to_drop != from_drop {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        to_drop,
+                        from_drop,
+                        "a whole-resource copy between differently dropped textures"
+                    )
+                });
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -511,11 +526,18 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        let dest_drop = crate::resource::mip_drop(dst.resource);
+        let dest_mips = crate::resource::title_mips(dst.resource);
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
+            if dest_drop > 0 {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("a buffer upload into a mip-dropped texture"));
+                return;
+            }
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
@@ -540,6 +562,19 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            let src_drop = crate::resource::mip_drop(src.resource);
+            if src_drop > 0 {
+                let Some(sub) = crate::resource::host_subresource(
+                    crate::resource::title_mips(src.resource),
+                    src_drop,
+                    from.footprint.offset as u32,
+                ) else {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!("a copy from a mip the host texture dropped"));
+                    return;
+                };
+                from.footprint.offset = u64::from(sub);
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
@@ -550,6 +585,18 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        if dst.kind != FOOTPRINT && dest_drop > 0 {
+            let Some(sub) = crate::resource::host_subresource(
+                dest_mips,
+                dest_drop,
+                to_location.footprint.offset as u32,
+            ) else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("a copy into a mip the host texture dropped"));
+                return;
+            };
+            to_location.footprint.offset = u64::from(sub);
+        }
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {

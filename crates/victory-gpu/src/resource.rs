@@ -786,6 +786,42 @@ pub(crate) fn host_resource<'a>(
     resource(this).host.as_deref().map(|h| &h.texture)
 }
 
+/// The title's mip count for a texture; 0 for buffers and null.
+pub(crate) fn title_mips(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        0
+    } else {
+        u32::from(r.desc.mip_levels)
+    }
+}
+
+/// Mips the host copy of a title texture is missing from the top
+/// (`VICTORY_TEXTURE_MIP_DROP`); 0 for buffers or a full-size copy.
+#[cfg(windows)]
+pub(crate) fn mip_drop(this: This) -> u32 {
+    let Some(texture) = host_resource(this) else {
+        return 0;
+    };
+    // SAFETY: a live resource.
+    let host_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+    title_mips(this).saturating_sub(host_mips)
+}
+
+/// A console subresource of a mip-dropped texture as a host subresource;
+/// `None` for a mip the host copy does not have.
+pub(crate) fn host_subresource(console_mips: u32, drop: u32, subresource: u32) -> Option<u32> {
+    if drop == 0 {
+        return Some(subresource);
+    }
+    let mip = (subresource % console_mips).checked_sub(drop)?;
+    let slice = subresource / console_mips;
+    Some(mip + slice * (console_mips - drop))
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
