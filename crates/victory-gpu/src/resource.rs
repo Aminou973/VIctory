@@ -850,6 +850,12 @@ pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
     {
         return 0;
     }
+    // Large textures only. The title's loading artwork is a pure sampled
+    // 1920x1080 texture too, and dropping it turns every presented frame into
+    // flat colour; below 2048 on both axes the saving is not worth that.
+    if desc.width < 2048 || desc.height < 2048 {
+        return 0;
+    }
     let mut k = drop;
     while k > 0 {
         if desc.mip_levels > k as u16
