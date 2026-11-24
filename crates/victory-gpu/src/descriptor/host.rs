@@ -621,6 +621,81 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// Adjusts the most detailed mip and mip count in a shader resource view
+/// when the underlying host texture had mips dropped for low VRAM budgets.
+fn adjust_srv_for_dropped_mips(
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+    drop: u32,
+    host_mips: u32,
+) {
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE1D => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture1D };
+            tex.MostDetailedMip = tex.MostDetailedMip.saturating_sub(drop);
+            if tex.MipLevels != u32::MAX {
+                let max_mips = host_mips.saturating_sub(tex.MostDetailedMip);
+                tex.MipLevels = tex.MipLevels.min(max_mips).max(1);
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture1DArray };
+            tex.MostDetailedMip = tex.MostDetailedMip.saturating_sub(drop);
+            if tex.MipLevels != u32::MAX {
+                let max_mips = host_mips.saturating_sub(tex.MostDetailedMip);
+                tex.MipLevels = tex.MipLevels.min(max_mips).max(1);
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture2D };
+            tex.MostDetailedMip = tex.MostDetailedMip.saturating_sub(drop);
+            if tex.MipLevels != u32::MAX {
+                let max_mips = host_mips.saturating_sub(tex.MostDetailedMip);
+                tex.MipLevels = tex.MipLevels.min(max_mips).max(1);
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture2DArray };
+            tex.MostDetailedMip = tex.MostDetailedMip.saturating_sub(drop);
+            if tex.MipLevels != u32::MAX {
+                let max_mips = host_mips.saturating_sub(tex.MostDetailedMip);
+                tex.MipLevels = tex.MipLevels.min(max_mips).max(1);
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURE3D => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture3D };
+            tex.MostDetailedMip = tex.MostDetailedMip.saturating_sub(drop);
+            if tex.MipLevels != u32::MAX {
+                let max_mips = host_mips.saturating_sub(tex.MostDetailedMip);
+                tex.MipLevels = tex.MipLevels.min(max_mips).max(1);
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.TextureCube };
+            tex.MostDetailedMip = tex.MostDetailedMip.saturating_sub(drop);
+            if tex.MipLevels != u32::MAX {
+                let max_mips = host_mips.saturating_sub(tex.MostDetailedMip);
+                tex.MipLevels = tex.MipLevels.min(max_mips).max(1);
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.TextureCubeArray };
+            tex.MostDetailedMip = tex.MostDetailedMip.saturating_sub(drop);
+            if tex.MipLevels != u32::MAX {
+                let max_mips = host_mips.saturating_sub(tex.MostDetailedMip);
+                tex.MipLevels = tex.MipLevels.min(max_mips).max(1);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -651,6 +726,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                let drop = crate::resource::texture_memory(resource)
+                    .map(|(_, orig)| {
+                        // SAFETY: live texture.
+                        let host_mips = unsafe { texture.GetDesc() }.MipLevels;
+                        u32::from(orig.mip_levels).saturating_sub(u32::from(host_mips))
+                    })
+                    .unwrap_or(0);
+                if let (true, Some(d)) = (drop > 0, desc.as_mut()) {
+                    // SAFETY: live texture.
+                    let host_mips = unsafe { texture.GetDesc() }.MipLevels;
+                    adjust_srv_for_dropped_mips(d, drop, u32::from(host_mips));
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

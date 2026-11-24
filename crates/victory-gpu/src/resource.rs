@@ -85,17 +85,17 @@ pub(crate) struct HeapDesc {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc {
-    dimension: u32,
-    alignment: u64,
-    width: u64,
-    height: u32,
-    depth_or_array_size: u16,
-    mip_levels: u16,
-    format: u32,
-    sample_count: u32,
-    sample_quality: u32,
-    layout: u32,
-    flags: u32,
+    pub(crate) dimension: u32,
+    pub(crate) alignment: u64,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) depth_or_array_size: u16,
+    pub(crate) mip_levels: u16,
+    pub(crate) format: u32,
+    pub(crate) sample_count: u32,
+    pub(crate) sample_quality: u32,
+    pub(crate) layout: u32,
+    pub(crate) flags: u32,
 }
 
 #[repr(C)]
@@ -797,6 +797,37 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
+/// Computes the number of mips to drop for this texture under the current
+/// mip drop setting. Pure sampled textures with sufficient mips and size
+/// are scaled down to reduce VRAM consumption on low-VRAM GPUs.
+pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
+    let drop = crate::texture::texture_mip_drop();
+    if drop == 0 {
+        return 0;
+    }
+    // Only drop for pure sampled textures: not buffers, not render targets,
+    // not depth buffers, not UAVs, and not textures with MSAA.
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    if desc.dimension == BUFFER
+        || desc.flags & TARGET_DEPTH_UNORDERED != 0
+        || desc.sample_count > 1
+    {
+        return 0;
+    }
+    let mut k = drop;
+    while k > 0 {
+        if desc.mip_levels > k as u16
+            && (desc.width >> k) > 0
+            && (desc.height >> k) > 0
+            && (desc.dimension != TEXTURE_3D || (desc.depth_or_array_size >> k) > 0)
+        {
+            return k;
+        }
+        k -= 1;
+    }
+    0
+}
+
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
@@ -813,6 +844,15 @@ fn host_texture(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    let drop = compute_mip_drop(desc);
+    if drop > 0 {
+        d.width = (d.width >> drop).max(1);
+        d.height = (d.height >> drop).max(1);
+        if d.dimension == TEXTURE_3D {
+            d.depth_or_array_size = (d.depth_or_array_size >> drop).max(1);
+        }
+        d.mip_levels -= drop as u16;
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
@@ -867,7 +907,14 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            if drop > 0 {
+                format!(
+                    "texture {}x{} f{} flags {:#x} (dropped {drop} mips from {}x{})",
+                    d.width, d.height, d.format, d.flags, desc.width, desc.height
+                )
+            } else {
+                format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            }
         });
     }
     texture
@@ -1407,6 +1454,36 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[test]
+    fn mip_drop_computation_respects_constraints() {
+        let sample_tex = texture(1024, 1024, 28, 10);
+        assert_eq!(sample_tex.flags, 0);
+
+        // When drop is 0:
+        // (compute_mip_drop checks crate::texture::texture_mip_drop())
+        // Render targets and depth buffers should never drop mips:
+        let mut rt_tex = sample_tex;
+        rt_tex.flags = 1; // RENDER_TARGET
+        assert_eq!(compute_mip_drop(&rt_tex), 0);
+
+        let mut depth_tex = sample_tex;
+        depth_tex.flags = 2; // DEPTH
+        assert_eq!(compute_mip_drop(&depth_tex), 0);
+
+        let mut uav_tex = sample_tex;
+        uav_tex.flags = 4; // UNORDERED
+        assert_eq!(compute_mip_drop(&uav_tex), 0);
+
+        // Textures with 1 mip should never drop:
+        let mut single_mip = sample_tex;
+        single_mip.mip_levels = 1;
+        assert_eq!(compute_mip_drop(&single_mip), 0);
+
+        // Buffer should never drop:
+        let buf = buffer(1024);
+        assert_eq!(compute_mip_drop(&buf), 0);
     }
 
     #[test]

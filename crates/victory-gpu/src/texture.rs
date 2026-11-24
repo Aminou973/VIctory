@@ -30,6 +30,21 @@ macro_rules! once {
     }};
 }
 
+/// The number of most detailed mips to drop for sampled host textures.
+/// 0: keep original resolution (default).
+/// 1: drop 1 mip (halves dimensions, ~75% VRAM savings).
+/// 2: drop 2 mips (quarters dimensions, ~93.75% VRAM savings).
+/// 3: drop 3 mips (eighths dimensions, ~98.4% VRAM savings).
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map_or(0, |v| v.min(3))
+    })
+}
+
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
@@ -43,6 +58,8 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// Dropped mips count (offset into console mips for detiling).
+    pub(crate) mip_drop: u32,
     memory: *const u8,
     last: Mutex<Last>,
 }
@@ -237,7 +254,8 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let (host_mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let console_mip = host_mip + self.mip_drop;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -247,9 +265,9 @@ impl Staging {
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, console_mip, slice, linear, pitch, pitch * rows as usize)
             {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+                tracing::warn!(?e, console_mip, slice, "texture not detiled");
                 return;
             }
         }
@@ -298,6 +316,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let mip_drop = u32::from(desc.mip_levels).saturating_sub(u32::from(d.MipLevels));
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -326,7 +345,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, mip_drop, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -336,6 +355,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_drop,
         memory,
         last: Mutex::default(),
     });
