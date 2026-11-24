@@ -4122,7 +4122,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err("DIAG scalar smem: operand not a scalar register");
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -4130,7 +4130,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err("DIAG scalar smem: unusual load width"),
         };
         // How the program uses the descriptor tells the view's kind.
         let use_at = self
@@ -4217,7 +4217,28 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
-            _ => return Err("a scalar memory read as data"),
+            _ => {
+                // The use point is a scalar operation, not an image or buffer
+                // access: the program reads the descriptor's words as data
+                // (dimension or address arithmetic). Infer the view from the
+                // used-resource entry, as the no-use-point path does, instead
+                // of refusing the program.
+                if used.is_some_and(|x| x.kind == ResourceType::Cbv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                match used.map(|x| x.dwords) {
+                    Some(8) => ((4 | u, 0x409), Some(4)),
+                    _ => {
+                        let stride = used.map_or(0, |x| x.stride);
+                        let props = if stride >= 4 && stride.is_multiple_of(4) {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        (props, None)
+                    }
+                }
+            }
         };
         self.descriptor_words(inst, site, &src, count, u32::from(first), code, props, image, uav)
     }
