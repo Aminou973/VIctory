@@ -119,7 +119,8 @@ pub(crate) fn apply(base: usize, size: usize, module: &str) {
             continue;
         }
         // SAFETY: in-bounds of the mapped image, made writable above.
-        let old = write(unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) }, patch);
+        // `write` indexes from the image start (patch.rva), so the slice starts at `base`.
+        let old = write(unsafe { std::slice::from_raw_parts_mut(base as *mut u8, patch.rva + len) }, patch);
         let mut ignored = 0;
         // SAFETY: restoring the range's own protection.
         unsafe { VirtualProtect(at as *const c_void, len, protection, &mut ignored) };

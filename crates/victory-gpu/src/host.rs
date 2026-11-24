@@ -447,6 +447,9 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Readback buffers copied to title memory once the list has run:
+    /// buffer, where, bytes.
+    readbacks: Vec<(ID3D12Resource, usize, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -637,6 +640,11 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
+            // The readbacks drain before the writes, which tell the title
+            // the GPU is done.
+            for (buffer, at, len) in &list.deferred().readbacks {
+                apply_readback(buffer, *at as *mut u8, *len);
+            }
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -1103,6 +1111,12 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    /// Copies `len` bytes of a readback `buffer` into title memory at
+    /// `dst` once the list has run.
+    pub(crate) fn defer_readback(&self, buffer: ID3D12Resource, dst: *mut u8, len: usize) {
+        self.deferred().readbacks.push((buffer, dst as usize, len));
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
@@ -1112,6 +1126,18 @@ impl HostList {
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
+    }
+
+    /// A readback buffer of `size` bytes, born in a copy-destination
+    /// state; kept like the upload buffers until the list is reset.
+    ///
+    /// shortcut: one buffer per readback; pool them once readbacks are
+    /// frequent.
+    pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<ID3D12Resource> {
+        let buffer = host.readback_buffer(size)?;
+        name(&buffer, || format!("list readback {size:#x}"));
+        self.deferred().uploads.push(buffer.clone());
+        Some(buffer)
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -1429,6 +1455,27 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
     }
 }
 
+/// Copies what a recorded readback holds into title memory, mapping its
+/// buffer, only now that the list has run.
+fn apply_readback(buffer: &ID3D12Resource, dst: *mut u8, len: usize) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
+    let range = D3D12_RANGE {
+        Begin: 0,
+        End: len,
+    };
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the list has run, so the readback buffer is idle; the read
+    // range covers all of it.
+    if let Err(e) = unsafe { buffer.Map(0, Some(&range), Some(&mut data)) } {
+        tracing::warn!(error = %e, len, "a readback could not be mapped");
+        return;
+    }
+    // SAFETY: the title's range is disjoint from the readback's mapping.
+    unsafe { std::ptr::copy_nonoverlapping(data.cast::<u8>(), dst, len) };
+    // SAFETY: the mapping is not used afterwards.
+    unsafe { buffer.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
+}
+
 impl Host {
     /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -1471,6 +1518,51 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer in the readback heap, born in a copy-destination state;
+    /// it is mapped for reading only once the commands that fill it are
+    /// done.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
                 None
             }
         }

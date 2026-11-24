@@ -497,8 +497,8 @@ pub(crate) struct CopyLocation {
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer (read back) through a
+/// readback buffer copied to title memory after the submission.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -522,8 +522,73 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            // Texture to title buffer (read back): the GPU copies the
+            // source into a readback buffer of the list, which is copied
+            // to the title's memory once the submission has run.
+            let done = dst.kind == FOOTPRINT
+                && src.kind != FOOTPRINT
+                && 'readback: {
+                    let Some(texture) = crate::resource::host_resource(src.resource) else {
+                        break 'readback false;
+                    };
+                    let (Some(host), Some(bytes)) = (crate::host::host(), dst.footprint.bytes()) else {
+                        break 'readback false;
+                    };
+                    let Some(title) = buffer_range(dst.resource, dst.footprint.offset, bytes) else {
+                        break 'readback false;
+                    };
+                    let Some(buffer) = list.readback(host, bytes) else {
+                        break 'readback false;
+                    };
+                    let mut from = src;
+                    let src_drop = crate::resource::mip_drop(src.resource);
+                    if src_drop > 0 {
+                        let Some(sub) = crate::resource::host_subresource(
+                            crate::resource::title_mips(src.resource),
+                            src_drop,
+                            from.footprint.offset as u32,
+                        ) else {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| tracing::warn!("a copy from a mip the host texture dropped"));
+                            break 'readback false;
+                        };
+                        from.footprint.offset = u64::from(sub);
+                    }
+                    if crate::texture::title_written(texture) {
+                        crate::texture::upload(list, src.resource, texture);
+                    }
+                    ensure_state(list, src.resource, COPY_SOURCE);
+                    from.resource = texture.as_raw().cast_const().cast();
+                    let mut to_location = dst;
+                    to_location.resource = buffer.as_raw().cast_const().cast();
+                    // The readback buffer holds exactly this footprint, so
+                    // its offset is 0.
+                    to_location.footprint.offset = 0;
+                    // SAFETY: an open list; both locations in the host's
+                    // layout, naming live resources.
+                    unsafe {
+                        list.list.CopyTextureRegion(
+                            (&raw const to_location).cast(),
+                            x,
+                            y,
+                            z,
+                            (&raw const from).cast(),
+                            (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>()),
+                        )
+                    };
+                    // The copy to the title's memory happens once the
+                    // submission has run.
+                    list.defer_readback(buffer, title, bytes as usize);
+                    true
+                };
+            if !done {
+                // What is left (no source host texture, a footprint
+                // source, a failed allocation) is not done.
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(dst = ?dst.resource, kind = dst.kind, "texture to buffer copies not implemented")
+                });
+            }
             return;
         };
         let dest_drop = crate::resource::mip_drop(dst.resource);
