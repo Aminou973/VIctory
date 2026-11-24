@@ -37,20 +37,30 @@ pub(crate) fn set_wave64_mode(mode: Wave64Mode) {
 }
 
 fn effective_wave64_mode() -> Wave64Mode {
+    effective_wave64_mode_with_source().0
+}
+
+/// The Wave64 lowering actually in use, and where it came from: `env` when
+/// `VICTORY_WAVE64_EMULATE` chose it, else the device recommendation the
+/// host recorded (`auto`). A log line that reports the recommendation
+/// instead of this has cost a full round of analysis: the window title
+/// drew the world under `Emulate` while the line still said `Wave32`.
+pub(crate) fn effective_wave64_mode_with_source() -> (Wave64Mode, &'static str) {
     if let Ok(v) = std::env::var("VICTORY_WAVE64_EMULATE") {
         match v.trim().to_ascii_lowercase().as_str() {
-            "0" | "native" => return Wave64Mode::Native,
-            "wave32" | "32" => return Wave64Mode::Wave32,
-            "1" | "emulate" | "force" => return Wave64Mode::Emulate,
+            "0" | "native" => return (Wave64Mode::Native, "env"),
+            "wave32" | "32" => return (Wave64Mode::Wave32, "env"),
+            "1" | "emulate" | "force" => return (Wave64Mode::Emulate, "env"),
             "" | "auto" => {}
             other => tracing::warn!(value = other, "unknown VICTORY_WAVE64_EMULATE; using auto"),
         }
     }
-    match WAVE64_MODE.load(Ordering::Relaxed) {
+    let mode = match WAVE64_MODE.load(Ordering::Relaxed) {
         1 => Wave64Mode::Wave32,
         2 => Wave64Mode::Emulate,
         _ => Wave64Mode::Native,
-    }
+    };
+    (mode, "auto")
 }
 
 /// Keeps translated shaders in `dir` from now on.

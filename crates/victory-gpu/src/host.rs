@@ -210,7 +210,17 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         let wave64_mode = recommended_wave64_mode(&device);
         crate::shader_cache::set_wave64_mode(wave64_mode);
-        tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
+        // The effective mode, not the recommendation: a log line reporting the
+        // recommendation while an environment variable chose otherwise sends
+        // readers after the wrong cause.
+        let (wave64_effective, wave64_source) =
+            crate::shader_cache::effective_wave64_mode_with_source();
+        tracing::info!(
+            ?wave64_mode,
+            ?wave64_effective,
+            wave64_source,
+            "Wave64 compute lowering mode (recommended, effective, source)"
+        );
         Ok(Host {
             device,
             queue,
